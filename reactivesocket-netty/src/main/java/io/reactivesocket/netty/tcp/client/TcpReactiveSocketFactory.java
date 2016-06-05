@@ -15,84 +15,114 @@
  */
 package io.reactivesocket.netty.tcp.client;
 
-import io.netty.channel.EventLoopGroup;
+import io.netty.buffer.ByteBuf;
 import io.reactivesocket.ConnectionSetupPayload;
-import io.reactivesocket.DefaultReactiveSocket;
+import io.reactivesocket.Frame;
 import io.reactivesocket.ReactiveSocket;
 import io.reactivesocket.ReactiveSocketFactory;
+import io.reactivesocket.netty.ReactiveSocketFrameCodec;
+import io.reactivesocket.netty.tcp.ReactiveSocketLengthCodec;
+import io.reactivesocket.netty.tcp.TcpDuplexConnection;
 import io.reactivesocket.rx.Completable;
+import io.reactivex.netty.channel.Connection;
+import io.reactivex.netty.protocol.tcp.client.TcpClient;
 import org.reactivestreams.Publisher;
-import org.reactivestreams.Subscriber;
-import org.reactivestreams.Subscription;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import rx.Observable;
 import rx.RxReactiveStreams;
+import rx.Single;
+import rx.Single.OnSubscribe;
+import rx.SingleSubscriber;
+import rx.Subscriber;
 
-import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
-/**
- * An implementation of {@link ReactiveSocketFactory} that creates Netty WebSocket ReactiveSockets.
- */
+import static io.reactivesocket.DefaultReactiveSocket.*;
+
 public class TcpReactiveSocketFactory implements ReactiveSocketFactory<SocketAddress, ReactiveSocket> {
+
     private static final Logger logger = LoggerFactory.getLogger(TcpReactiveSocketFactory.class);
 
-    private final ConnectionSetupPayload connectionSetupPayload;
+    private final Function<SocketAddress, TcpClient<ByteBuf, ByteBuf>> clientFactory;
+    private final ConnectionSetupPayload setup;
     private final Consumer<Throwable> errorStream;
-    private final EventLoopGroup eventLoopGroup;
 
-    public TcpReactiveSocketFactory(EventLoopGroup eventLoopGroup, ConnectionSetupPayload connectionSetupPayload, Consumer<Throwable> errorStream) {
-        this.connectionSetupPayload = connectionSetupPayload;
+    public TcpReactiveSocketFactory(Function<SocketAddress, TcpClient<ByteBuf, ByteBuf>> clientFactory,
+                                    ConnectionSetupPayload connectionSetupPayload, Consumer<Throwable> errorStream) {
+        this.clientFactory = clientFactory;
+        setup = connectionSetupPayload;
         this.errorStream = errorStream;
-        this.eventLoopGroup = eventLoopGroup;
     }
 
     @Override
     public Publisher<ReactiveSocket> call(SocketAddress address) {
-        if (address instanceof InetSocketAddress) {
-            Publisher<ClientTcpDuplexConnection> connection
-                    = ClientTcpDuplexConnection.create((InetSocketAddress)address, eventLoopGroup);
+        TcpClient<Frame, Frame> client = clientFactory.apply(address)
+                                                      .addChannelHandlerLast("length-codec",
+                                                                             ReactiveSocketLengthCodec::new)
+                                                      .addChannelHandlerLast("frame-codec",
+                                                                             ReactiveSocketFrameCodec::new);
 
-            Observable<ReactiveSocket> result = Observable.create(s ->
-                connection.subscribe(new Subscriber<ClientTcpDuplexConnection>() {
-                    @Override
-                    public void onSubscribe(Subscription s) {
-                        s.request(1);
-                    }
+        Single<ReactiveSocket> r = Single.create(new OnSubscribe<ReactiveSocket>() {
+            @Override
+            public void call(SingleSubscriber<? super ReactiveSocket> s) {
+                client.createConnectionRequest()
+                      .toSingle()
+                      .unsafeSubscribe(new Subscriber<Connection<Frame, Frame>>() {
+                          @Override
+                          public void onCompleted() {
+                              // Single contract does not allow complete without onNext and onNext here completes
+                              // the outer subscriber
+                          }
 
-                    @Override
-                    public void onNext(ClientTcpDuplexConnection connection) {
-                        ReactiveSocket reactiveSocket = DefaultReactiveSocket.fromClientConnection(connection, connectionSetupPayload, errorStream);
-                        reactiveSocket.start(new Completable() {
-                            @Override
-                            public void success() {
-                                s.onNext(reactiveSocket);
-                                s.onCompleted();
-                            }
+                          @Override
+                          public void onError(Throwable e) {
+                              s.onError(e);
+                          }
 
-                            @Override
-                            public void error(Throwable e) {
-                                s.onError(e);
-                            }
-                        });
-                    }
+                          @Override
+                          public void onNext(Connection<Frame, Frame> c) {
+                              TcpDuplexConnection dc = new TcpDuplexConnection(c);
+                              ReactiveSocket rs = fromClientConnection(dc, setup, errorStream);
+                              rs.start(new Completable() {
+                                  @Override
+                                  public void success() {
+                                      s.onSuccess(rs);
+                                  }
 
-                    @Override
-                    public void onError(Throwable t) {
-                        s.onError(t);
-                    }
+                                  @Override
+                                  public void error(Throwable e) {
+                                      s.onError(e);
+                                  }
+                              });
+                          }
+                      });
+            }
+        });
+        return RxReactiveStreams.toPublisher(r.toObservable());
+    }
 
-                    @Override
-                    public void onComplete() {
-                    }
-                })
-            );
+    public static TcpReactiveSocketFactory create(ConnectionSetupPayload setupPayload) {
+        return create(socketAddress -> {
+            return TcpClient.newClient(socketAddress);
+        }, setupPayload, new Consumer<Throwable>() {
+            @Override
+            public void accept(Throwable throwable) {
+                logger.error("Error received on ReactiveSocket.", throwable);
+            }
+        });
+    }
 
-            return RxReactiveStreams.toPublisher(result);
-        } else {
-            throw new IllegalArgumentException("unknown socket address type => " + address.getClass());
-        }
+    public static TcpReactiveSocketFactory create(ConnectionSetupPayload setupPayload, Consumer<Throwable> errorStream) {
+        return create(socketAddress -> {
+            return TcpClient.newClient(socketAddress);
+        }, setupPayload, errorStream);
+    }
+
+    public static TcpReactiveSocketFactory create(Function<SocketAddress, TcpClient<ByteBuf, ByteBuf>> clientFactory,
+                                                  ConnectionSetupPayload setupPayload,
+                                                  Consumer<Throwable> errorStream) {
+        return new TcpReactiveSocketFactory(clientFactory, setupPayload, errorStream);
     }
 }

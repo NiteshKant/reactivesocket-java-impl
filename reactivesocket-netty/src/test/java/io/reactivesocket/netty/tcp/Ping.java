@@ -15,97 +15,67 @@
  */
 package io.reactivesocket.netty.tcp;
 
-import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.buffer.ByteBuf;
 import io.reactivesocket.ConnectionSetupPayload;
-import io.reactivesocket.DefaultReactiveSocket;
 import io.reactivesocket.Payload;
 import io.reactivesocket.ReactiveSocket;
-import io.reactivesocket.netty.tcp.client.ClientTcpDuplexConnection;
+import io.reactivesocket.netty.tcp.client.TcpReactiveSocketFactory;
+import io.reactivex.netty.protocol.tcp.client.TcpClient;
 import org.HdrHistogram.Recorder;
-import org.reactivestreams.Publisher;
 import rx.Observable;
-import rx.RxReactiveStreams;
-import rx.Subscriber;
-import rx.schedulers.Schedulers;
+import rx.observers.TestSubscriber;
 
 import java.net.InetSocketAddress;
-import java.nio.ByteBuffer;
-import java.util.concurrent.CountDownLatch;
+import java.net.SocketAddress;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+
+import static rx.RxReactiveStreams.*;
 
 public class Ping {
     public static void main(String... args) throws Exception {
-        Publisher<ClientTcpDuplexConnection> publisher = ClientTcpDuplexConnection
-            .create(InetSocketAddress.createUnresolved("localhost", 7878), new NioEventLoopGroup(1));
 
-        ClientTcpDuplexConnection duplexConnection = RxReactiveStreams.toObservable(publisher).toBlocking().last();
-        ReactiveSocket reactiveSocket = DefaultReactiveSocket.fromClientConnection(duplexConnection, ConnectionSetupPayload.create("UTF-8", "UTF-8"), t -> t.printStackTrace());
+        Payload keyPayload = new PayloadImpl("hello");
+        TcpReactiveSocketFactory factory = TcpReactiveSocketFactory.create(
+                new Function<SocketAddress, TcpClient<ByteBuf, ByteBuf>>() {
+                    @Override
+                    public TcpClient<ByteBuf, ByteBuf> apply(SocketAddress socketAddress) {
+                        return TcpClient.newClient(socketAddress);
+                    }
+                }, ConnectionSetupPayload.create("", ""), Throwable::printStackTrace);
 
-        reactiveSocket.startAndWait();
-
-        byte[] data = "hello".getBytes();
-
-        Payload keyPayload = new Payload() {
-            @Override
-            public ByteBuffer getData() {
-                return ByteBuffer.wrap(data);
-            }
-
-            @Override
-            public ByteBuffer getMetadata() {
-                return null;
-            }
-        };
+        ReactiveSocket reactiveSocket =
+                toObservable(factory.call(new InetSocketAddress("localhost", 7878)))
+                                 .toSingle()
+                                 .toBlocking().value();
 
         int n = 1_000_000;
-        CountDownLatch latch = new CountDownLatch(n);
         final Recorder histogram = new Recorder(3600000000000L, 3);
 
-        Schedulers
-            .computation()
-            .createWorker()
-            .schedulePeriodically(() -> {
-                System.out.println("---- PING/ PONG HISTO ----");
-                histogram.getIntervalHistogram()
-                    .outputPercentileDistribution(System.out, 5, 1000.0, false);
-                System.out.println("---- PING/ PONG HISTO ----");
-            }, 1, 1, TimeUnit.SECONDS);
+        Observable.interval(1, 1, TimeUnit.SECONDS)
+                  .forEach(aLong -> {
+                      System.out.println("---- PING/ PONG HISTO ----");
+                      histogram.getIntervalHistogram()
+                               .outputPercentileDistribution(System.out, 5, 1000.0, false);
+                      System.out.println("---- PING/ PONG HISTO ----");
+                  });
 
-        Observable
-            .range(1, Integer.MAX_VALUE)
-            .flatMap(i -> {
-                long start = System.nanoTime();
+        TestSubscriber<Payload> sub = new TestSubscriber<>();
+        Observable.range(1, Integer.MAX_VALUE)
+                  .flatMap(i -> {
+                      long start = System.nanoTime();
+                      keyPayload.getData().rewind();
+                      return toObservable(reactiveSocket.requestResponse(keyPayload))
+                              .doOnError(t -> t.printStackTrace())
+                              .doOnNext(s -> {
+                                  long diff = System.nanoTime() - start;
+                                  histogram.recordValue(diff);
+                              });
+                  }, 16)
+                  .doOnError(t -> t.printStackTrace())
+                  .take(n)
+                  .subscribe(sub);
 
-                return RxReactiveStreams
-                    .toObservable(
-                        reactiveSocket
-                            .requestResponse(keyPayload))
-                    .doOnError(t -> t.printStackTrace())
-                    .doOnNext(s -> {
-                        long diff = System.nanoTime() - start;
-                        histogram.recordValue(diff);
-                    });
-            }, 16)
-            .doOnError(t -> t.printStackTrace())
-            .subscribe(new Subscriber<Payload>() {
-                @Override
-                public void onCompleted() {
-
-                }
-
-                @Override
-                public void onError(Throwable e) {
-                    e.printStackTrace();
-                }
-
-                @Override
-                public void onNext(Payload payload) {
-                    latch.countDown();
-                }
-            });
-
-        latch.await(1, TimeUnit.HOURS);
-        System.out.println("Sent => " + n);
-        System.exit(0);
+        sub.awaitTerminalEvent(1, TimeUnit.HOURS);
     }
 }

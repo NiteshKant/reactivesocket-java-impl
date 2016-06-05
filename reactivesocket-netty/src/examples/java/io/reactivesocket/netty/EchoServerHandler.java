@@ -8,19 +8,20 @@ import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.HttpObjectAggregator;
 import io.netty.handler.codec.http.HttpServerCodec;
-import io.reactivesocket.RequestHandler;
-import io.reactivesocket.netty.tcp.server.ReactiveSocketServerHandler;
+import io.reactivesocket.exceptions.UnsupportedSetupException;
 
 import java.util.List;
 
 public class EchoServerHandler extends ByteToMessageDecoder {
     private static SimpleChannelInboundHandler<FullHttpRequest> httpHandler = new HttpServerHandler();
 
+/*
     private static ReactiveSocketServerHandler reactiveSocketHandler = ReactiveSocketServerHandler.create((setupPayload, rs) ->
         new RequestHandler.Builder().withRequestResponse(payload -> s -> {
             s.onNext(payload);
             s.onComplete();
         }).build());
+*/
 
     @Override
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
@@ -60,8 +61,6 @@ public class EchoServerHandler extends ByteToMessageDecoder {
     }
 
     private void switchToReactiveSocket(ChannelHandlerContext ctx) {
-        ChannelPipeline p = ctx.pipeline();
-        p.addLast(reactiveSocketHandler);
-        p.remove(this);
+        ctx.fireExceptionCaught(new UnsupportedSetupException("Not supporting multi-protocol switch"));
     }
 }
